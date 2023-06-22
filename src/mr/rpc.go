@@ -23,7 +23,26 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type AllocateTaskArgs struct {
+}
 
+type AllocateTaskReply struct {
+  TaskIsMap    bool
+  TaskIsReduce bool
+  Filename     string
+  BucketNum    int 
+  MapTaskNum   int
+  NumReduce    int
+}
+
+type CompleteTaskArgs struct {
+  LastTaskIsMap  bool
+  LastTaskFile   string
+  LastTaskBucket int  
+}
+
+type CompleteTaskReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
