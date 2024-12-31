@@ -16,6 +16,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId int64 // client id, used for deduplication in raft servers.
+	Seq      int64 // sequence number of the request from client, used for deduplication in raft servers.
 }
 
 type PutAppendReply struct {
@@ -25,6 +27,8 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClientId int64 // client id, used for deduplication in raft servers.
+	Seq      int64 // sequence number of the request from client, used for deduplication in raft servers.
 }
 
 type GetReply struct {

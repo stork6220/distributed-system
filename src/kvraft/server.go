@@ -1,28 +1,29 @@
 package kvraft
 
 import (
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	// 操作类型: "Get", "Put", 或 "Append"
+	OpType string
+
+	// 操作的键值对
+	Key   string
+	Value string
+
+	// 用于请求去重
+	ClientId  int64 // 客户端的唯一标识
+	RequestId int64 // 该客户端的请求序号
+
+	// 可选：用于调试
+	Term int // 操作被提交时的任期号
 }
 
 type KVServer struct {
@@ -33,17 +34,72 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	kvStore      map[string]string
 
-	// Your definitions here.
+	// 客户端请求追踪
+	lastApplied map[int64]int64 // Track last applied sequence per client
+	notifyCh    map[int]chan Op // Notification channels for completed operations
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-}
+	kv.mu.Lock()
+	if lastSeq, ok := kv.lastApplied[args.ClientId]; ok && args.Seq <= lastSeq {
+		// Return the cached result
+		value, exists := kv.kvStore[args.Key]
+		kv.mu.Unlock()
+		if !exists {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Value = value
+			reply.Err = OK
+		}
+		return
+	}
+	kv.mu.Unlock()
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	// Start consensus for new request
+	op := Op{
+		OpType:    "Get",
+		Key:       args.Key,
+		ClientId:  args.ClientId,
+		RequestId: args.Seq,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// Create notification channel and wait for result
+	ch := make(chan Op, 1)
+	kv.mu.Lock()
+	kv.notifyCh[index] = ch
+	kv.mu.Unlock()
+
+	select {
+	case result := <-ch:
+		if result.ClientId != args.ClientId || result.RequestId != args.Seq {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		kv.mu.Lock()
+		value, exists := kv.kvStore[args.Key]
+		kv.mu.Unlock()
+
+		if !exists {
+			reply.Err = ErrNoKey
+		} else {
+			reply.Value = value
+			reply.Err = OK
+		}
+	case <-time.After(time.Second):
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	delete(kv.notifyCh, index)
+	kv.mu.Unlock()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -54,15 +110,57 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
-func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
-	// Your code here, if desired.
-}
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	if lastSeq, ok := kv.lastApplied[args.ClientId]; ok && args.Seq <= lastSeq {
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
+	}
+	kv.mu.Unlock()
 
-func (kv *KVServer) killed() bool {
-	z := atomic.LoadInt32(&kv.dead)
-	return z == 1
+	op := Op{
+		OpType:    args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.Seq,
+	}
+
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	ch := make(chan Op, 1)
+	kv.mu.Lock()
+	kv.notifyCh[index] = ch
+	kv.mu.Unlock()
+
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.notifyCh, index)
+		kv.mu.Unlock()
+	}()
+
+	select {
+	case result := <-ch:
+		currentTerm, isLeader := kv.rf.GetState()
+		if !isLeader || term != currentTerm {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		if result.ClientId != args.ClientId || result.RequestId != args.Seq {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		reply.Err = OK
+	case <-timer.C: // 使用 timer 而不是 time.After
+		reply.Err = ErrWrongLeader
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -85,13 +183,56 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
+	kv.kvStore = make(map[string]string)
+	kv.lastApplied = make(map[int64]int64)
+	kv.notifyCh = make(map[int]chan Op)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
-
+	go kv.applyLoop()
 	return kv
+}
+
+// Kill marks this server as dead and initiates shutdown.
+// This is used by the tester to cleanly stop the server.
+func (kv *KVServer) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill() // Terminate the underlying Raft instance
+}
+
+// killed returns true if the server has been killed.
+// This is used to check whether the server should continue processing.
+func (kv *KVServer) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+func (kv *KVServer) applyLoop() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		if !msg.CommandValid {
+			continue
+		}
+		op := msg.Command.(Op)
+		kv.mu.Lock()
+
+		// Check if this is a new operation from this client
+		if lastSeq, exist := kv.lastApplied[op.ClientId]; !exist || op.RequestId > lastSeq {
+			// Apply the operation
+			switch op.OpType {
+			case "Put":
+				kv.kvStore[op.Key] = op.Value
+			case "Append":
+				kv.kvStore[op.Key] += op.Value
+			}
+			kv.lastApplied[op.ClientId] = op.RequestId
+		}
+
+		// Notify waiting RPC if any
+		if ch, ok := kv.notifyCh[msg.CommandIndex]; ok {
+			ch <- op // Notify the waiting RPC
+		}
+
+		kv.mu.Unlock()
+	}
 }
