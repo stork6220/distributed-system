@@ -60,8 +60,8 @@ type NodeState string
 
 const (
 	Candidate NodeState = "candidate"
-	Follower            = "follower"
-	Leader              = "leader"
+	Follower  NodeState = "follower"
+	Leader    NodeState = "leader"
 )
 
 // A Go object implementing a single Raft peer.
@@ -150,6 +150,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.lastIncludeTerm)
 
 	rf.lastApplied, rf.commitIndex = rf.lastIncludeIndex, rf.lastIncludeIndex
+	rf.snapshot = rf.persister.ReadSnapshot()
 }
 
 type InstallSnapshotArgs struct {
@@ -164,10 +165,11 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
+// RPC handler for sendSnapshot RPC.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer rf.persist()
+	defer rf.mu.Unlock()
 
 	// 1. Reply immediately if term < currentTerm
 	if args.Term < rf.currentTerm {
@@ -188,13 +190,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
 	var newLogs []LogEntry
-	if args.LastIncludeIndex-rf.lastIncludeIndex < len(rf.logs) &&
-		args.LastIncludeIndex >= rf.lastIncludeIndex &&
-		rf.getLogAt(args.LastIncludeIndex).Term == args.LastIncludeTerm {
-		newLogs = append(make([]LogEntry, 0), rf.logs[args.LastIncludeIndex-rf.lastIncludeIndex:]...)
-		//return
+
+	// 安全地检查日志匹配
+	if entry, ok := rf.getLogAt(args.LastIncludeIndex); ok &&
+		entry.Term == args.LastIncludeTerm {
+		// 保留后续日志
+		newLogs = append([]LogEntry{},
+			rf.logs[args.LastIncludeIndex-rf.lastIncludeIndex:]...)
 	} else {
-		// 7. Discard the entire log
+		// 丢弃所有日志
 		newLogs = []LogEntry{{Command: nil, Term: args.LastIncludeTerm}}
 	}
 
@@ -207,23 +211,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludeIndex > rf.commitIndex {
 		rf.commitIndex = args.LastIncludeIndex
 	}
-
-	/*
-		if args.LastIncludeIndex > lastApplied {
-			rf.lastApplied = args.LastIncludeIndex
-
-			// 8. Reset state machine using snapshot contents (and load snapshot's cluster configuration)
-			msg := ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      args.Data,
-				SnapshotTerm:  args.LastIncludeTerm,
-				SnapshotIndex: args.LastIncludeIndex,
-			}
-			rf.mu.Unlock()
-			rf.applyCh <- msg
-			rf.mu.Lock()
-		}
-	*/
 
 	if args.LastIncludeIndex > lastApplied {
 		rf.lastApplied = args.LastIncludeIndex
@@ -268,13 +255,26 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return
 	}
 
+	// 确保日志存在
 	if index-rf.lastIncludeIndex >= len(rf.logs) {
 		return
 	}
 
-	lastIncludeTerm := rf.getLogAt(index).Term
+	// 安全获取日志条目
+	entry, ok := rf.getLogAt(index)
+	if !ok {
+		return // 如果日志条目不存在，直接返回
+	}
+	lastIncludeTerm := entry.Term
 
-	newLog := append(make([]LogEntry, 0), rf.logs[index-rf.lastIncludeIndex:]...)
+	// 创建新的日志切片
+	newLog := make([]LogEntry, 0)
+	// 注意：这里要检查切片范围
+	if index-rf.lastIncludeIndex < len(rf.logs) {
+		newLog = append(newLog, rf.logs[index-rf.lastIncludeIndex:]...)
+	}
+
+	// 更新快照相关状态
 	rf.lastIncludeIndex = index
 	rf.lastIncludeTerm = lastIncludeTerm
 	rf.logs = newLog
@@ -308,8 +308,14 @@ func min(a, b int) int {
 	return b
 }
 
-func (rf *Raft) getLogAt(i int) LogEntry {
-	return rf.logs[i-rf.lastIncludeIndex]
+func (rf *Raft) getLogAt(i int) (LogEntry, bool) {
+	if i < rf.lastIncludeIndex {
+		return LogEntry{}, false
+	}
+	if i-rf.lastIncludeIndex < 0 || i-rf.lastIncludeIndex >= len(rf.logs) {
+		return LogEntry{}, false
+	}
+	return rf.logs[i-rf.lastIncludeIndex], true
 }
 
 func (rf *Raft) logLen() int {
@@ -321,7 +327,14 @@ func (rf *Raft) getLastIndex() int {
 }
 
 func (rf *Raft) getLastTerm() int {
-	return rf.getLogAt(rf.getLastIndex()).Term
+	if entry, ok := rf.getLogAt(rf.getLastIndex()); ok {
+		return entry.Term
+	}
+	return rf.lastIncludeTerm
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
 }
 
 type RequestVoteArgs struct {
@@ -367,11 +380,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) isLogUpToDate(argLastIndex int, argLastTerm int) bool {
-	if argLastTerm == rf.getLastTerm() {
-		return argLastIndex >= rf.getLastIndex()
+	// 获取自己的最后日志条目信息（考虑快照）
+	myLastLogIndex := rf.getLastIndex()
+	myLastLogTerm := rf.getLastTerm()
+
+	if argLastTerm != myLastLogTerm {
+		return argLastTerm > myLastLogTerm
 	}
 
-	return argLastTerm > rf.getLastTerm()
+	return argLastIndex >= myLastLogIndex
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -476,30 +493,52 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// 获取 PrevLogIndex 处的任期
 	prevLogIndexTerm := rf.lastIncludeTerm
-	if args.PrevLogIndex >= rf.lastIncludeIndex && args.PrevLogTerm < rf.logLen() {
-		prevLogIndexTerm = rf.getLogAt(args.PrevLogIndex).Term
+	if args.PrevLogIndex >= rf.lastIncludeIndex {
+		entry, ok := rf.getLogAt(args.PrevLogIndex)
+		if !ok {
+			reply.XTerm = -1
+			reply.XLen = args.PrevLogIndex - rf.logLen() + 1
+			return
+		}
+		prevLogIndexTerm = entry.Term
 	}
+
+	// 检查任期是否匹配
 	if prevLogIndexTerm != args.PrevLogTerm {
 		reply.XTerm = prevLogIndexTerm
-		for i := args.PrevLogIndex; i >= rf.lastIncludeIndex && rf.getLogAt(i).Term == reply.XTerm; i-- {
-			reply.XIndex = i
+		// 找到任期冲突的第一个日志
+		for i := args.PrevLogIndex; i >= rf.lastIncludeIndex; i-- {
+			if entry, ok := rf.getLogAt(i); ok && entry.Term == reply.XTerm {
+				reply.XIndex = i
+			} else {
+				break
+			}
 		}
 		return
 	}
 
+	// 日志匹配成功
 	reply.Success = true
+
 	// 3. If an existing entry conflict with a new one (same index but different terms), delete the existing entry and all that folow it
 	i, j := args.PrevLogIndex+1, 0
 	for ; i <= rf.getLastIndex() && j < len(args.Entries); i, j = i+1, j+1 {
-		if rf.getLogAt(i).Term != args.Entries[j].Term {
+		entry, ok := rf.getLogAt(i)
+		if !ok || entry.Term != args.Entries[j].Term {
 			break
 		}
 	}
-	rf.logs = rf.logs[:i-rf.lastIncludeIndex]
-	args.Entries = args.Entries[j:]
+	if i-rf.lastIncludeIndex > 0 {
+		rf.logs = rf.logs[:i-rf.lastIncludeIndex]
+	} else {
+		// 如果计算结果小于等于0，则清空日志
+		rf.logs = make([]LogEntry, 0)
+	}
+
 	// 4. Append any new entries not already in the log
-	rf.logs = append(rf.logs, args.Entries...)
+	rf.logs = append(rf.logs, args.Entries[j:]...)
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
@@ -538,7 +577,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		hasReplyTerm := false
 		lastIndex := rf.nextIndex[server] - 1
 		for i := lastIndex; i >= rf.lastIncludeIndex; i-- {
-			if rf.getLogAt(i).Term == reply.Term {
+			if entry, ok := rf.getLogAt(i); ok && entry.Term == reply.Term {
 				hasReplyTerm = true
 				break
 			}
@@ -557,10 +596,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) updateCommitIndex() {
 	for n := rf.getLastIndex(); n > rf.commitIndex; n-- {
 		count := 1
+
+		// 获取该索引处的日志条目
+		entry, ok := rf.getLogAt(n)
+		if !ok {
+			continue
+		}
+
 		// a leader is not allowed to update commitIndex to somewhere in a previous term (or, for that mater, a future term)
 		// This is because Raft leaders cannot be sure an entry is actually commited (and will not ever be changed in the future) if it's not from their current term.
 		// This is illustrated by Figure 8 in the paper
-		if rf.getLogAt(n).Term == rf.currentTerm {
+		if entry.Term == rf.currentTerm {
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me && rf.matchIndex[i] >= n {
 					count++
@@ -648,12 +694,13 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 
 	// 预先准备好所有参数
-	args := make([]interface{}, len(rf.peers)) // interface{}用于同时存储InstallSnapshotArgs和AppendEntriesArgs
+	args := make([]interface{}, len(rf.peers))
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
 
+		// 如果 nextIndex 落后于快照，发送快照
 		if rf.lastIncludeIndex >= rf.nextIndex[server] {
 			args[server] = &InstallSnapshotArgs{
 				Term:             rf.currentTerm,
@@ -663,12 +710,37 @@ func (rf *Raft) broadcastAppendEntries() {
 				Data:             rf.snapshot,
 			}
 		} else {
-			entries := append(make([]LogEntry, 0), rf.logs[rf.nextIndex[server]-rf.lastIncludeIndex:]...)
+			// 准备日志条目
+			prevLogIndex := rf.nextIndex[server] - 1
+			var prevLogTerm int
+			// 安全获取 PrevLogTerm
+			if prevLogIndex == rf.lastIncludeIndex {
+				prevLogTerm = rf.lastIncludeTerm
+			} else if entry, ok := rf.getLogAt(prevLogIndex); ok {
+				prevLogTerm = entry.Term
+			} else {
+				// 如果无法获取前一个日志的任期，回退到发送快照
+				args[server] = &InstallSnapshotArgs{
+					Term:             rf.currentTerm,
+					LeaderId:         rf.me,
+					LastIncludeIndex: rf.lastIncludeIndex,
+					LastIncludeTerm:  rf.lastIncludeTerm,
+					Data:             rf.snapshot,
+				}
+				continue
+			}
+
+			// 准备要发送的日志条目
+			entries := make([]LogEntry, 0)
+			if rf.nextIndex[server]-rf.lastIncludeIndex <= len(rf.logs) {
+				entries = append(entries, rf.logs[rf.nextIndex[server]-rf.lastIncludeIndex:]...)
+			}
+
 			args[server] = &AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
-				PrevLogIndex: rf.nextIndex[server] - 1,
-				PrevLogTerm:  rf.getLogAt(rf.nextIndex[server] - 1).Term,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
 				LeaderCommit: rf.commitIndex,
 				Entries:      entries,
 			}
@@ -775,13 +847,30 @@ func (rf *Raft) committer() {
 			rf.mu.Lock()
 		} else if rf.lastApplied < rf.commitIndex {
 			// Apply log[lastApplied] to state machine
-			for rf.lastApplied < rf.commitIndex && rf.commitIndex <= rf.getLastIndex() {
-				rf.lastApplied++
+			for rf.lastApplied < rf.commitIndex {
+				nextIndex := rf.lastApplied + 1
+
+				// 确保不会超过日志末尾
+				if nextIndex > rf.getLastIndex() {
+					break
+				}
+
+				// 安全获取日志条目
+				entry, ok := rf.getLogAt(nextIndex)
+				if !ok {
+					// 如果无法获取日志条目，可能需要安装快照
+					break
+				}
+
 				msg := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.getLogAt(rf.lastApplied).Command,
-					CommandIndex: rf.lastApplied,
+					Command:      entry.Command,
+					CommandIndex: nextIndex,
 				}
+
+				// 在发送消息前更新 lastApplied
+				rf.lastApplied = nextIndex
+
 				rf.mu.Unlock()
 				rf.applyCh <- msg
 				rf.mu.Lock()
@@ -811,9 +900,9 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			// 动态调整心跳间隔
-			interval := 50 * time.Millisecond // 基础心跳间隔
+			interval := 33 * time.Millisecond // 基础心跳间隔
 			if hasNewEntries {
-				interval = 30 * time.Millisecond // 有新日志时加快复制
+				interval = 15 * time.Millisecond // 有新日志时加快复制
 			}
 
 			<-time.After(interval)

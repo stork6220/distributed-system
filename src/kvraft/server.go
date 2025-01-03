@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +37,7 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 	kvStore      map[string]string
+	lastIndex    int // 追踪最后应用的命令索引
 
 	// 客户端请求追踪
 	lastApplied map[int64]int64 // Track last applied sequence per client
@@ -113,8 +116,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	if lastSeq, ok := kv.lastApplied[args.ClientId]; ok && args.Seq <= lastSeq {
-		kv.mu.Unlock()
 		reply.Err = OK
+		kv.mu.Unlock()
 		return
 	}
 	kv.mu.Unlock()
@@ -138,13 +141,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.notifyCh[index] = ch
 	kv.mu.Unlock()
 
-	timer := time.NewTimer(50 * time.Millisecond)
+	timer := time.NewTimer(12 * time.Millisecond)
 	defer timer.Stop()
-	defer func() {
-		kv.mu.Lock()
-		delete(kv.notifyCh, index)
-		kv.mu.Unlock()
-	}()
 
 	select {
 	case result := <-ch:
@@ -161,6 +159,34 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-timer.C: // 使用 timer 而不是 time.After
 		reply.Err = ErrWrongLeader
 	}
+}
+
+// decodeSnapshot 从快照数据中恢复服务器状态
+// 返回 bool 表示解码是否成功
+// decodeSnapshot 函数也可以简化
+func (kv *KVServer) decodeSnapshot(snapshot []byte) bool {
+	if len(snapshot) == 0 {
+		return false
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var kvStore map[string]string
+	if err := d.Decode(&kvStore); err != nil {
+		fmt.Printf("Error decoding kvStore from snapshot: %v\n", err)
+		return false
+	}
+
+	var lastApplied map[int64]int64
+	if err := d.Decode(&lastApplied); err != nil {
+		fmt.Printf("Error decoding lastApplied from snapshot: %v\n", err)
+		return false
+	}
+
+	kv.kvStore = kvStore
+	kv.lastApplied = lastApplied
+	return true
 }
 
 // servers[] contains the ports of the set of
@@ -185,8 +211,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.kvStore = make(map[string]string)
 	kv.lastApplied = make(map[int64]int64)
+	kv.lastIndex = 0
 	kv.notifyCh = make(map[int]chan Op)
 	kv.applyCh = make(chan raft.ApplyMsg)
+
+	// 从 persister 读取快照
+	kv.decodeSnapshot(persister.ReadSnapshot())
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applyLoop()
@@ -210,29 +241,58 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyLoop() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
-		if !msg.CommandValid {
-			continue
-		}
-		op := msg.Command.(Op)
-		kv.mu.Lock()
-
-		// Check if this is a new operation from this client
-		if lastSeq, exist := kv.lastApplied[op.ClientId]; !exist || op.RequestId > lastSeq {
-			// Apply the operation
-			switch op.OpType {
-			case "Put":
-				kv.kvStore[op.Key] = op.Value
-			case "Append":
-				kv.kvStore[op.Key] += op.Value
+		if msg.SnapshotValid {
+			// This is a snapshot
+			kv.mu.Lock()
+			// 只有当快照的索引大于当前已应用的索引时才应用快照
+			if msg.SnapshotIndex > kv.lastIndex {
+				if kv.decodeSnapshot(msg.Snapshot) {
+					kv.lastIndex = msg.SnapshotIndex
+				}
 			}
-			kv.lastApplied[op.ClientId] = op.RequestId
-		}
+			kv.mu.Unlock()
+		} else if msg.CommandValid {
+			op := msg.Command.(Op)
+			kv.mu.Lock()
 
-		// Notify waiting RPC if any
-		if ch, ok := kv.notifyCh[msg.CommandIndex]; ok {
-			ch <- op // Notify the waiting RPC
-		}
+			if msg.CommandIndex > kv.lastIndex || msg.SnapshotValid {
+				// Check if this is a new operation from this client
+				if lastSeq, exist := kv.lastApplied[op.ClientId]; !exist || op.RequestId > lastSeq {
+					// Apply the operation
+					switch op.OpType {
+					case "Put":
+						kv.kvStore[op.Key] = op.Value
+					case "Append":
+						kv.kvStore[op.Key] += op.Value
+					}
+					kv.lastApplied[op.ClientId] = op.RequestId
 
-		kv.mu.Unlock()
+					// 在应用命令后更新lastIndex
+					kv.lastIndex = msg.CommandIndex
+
+					// Check if we need to create a snapshot
+					if kv.maxraftstate > 0 && kv.rf.RaftStateSize() > kv.maxraftstate {
+						w := new(bytes.Buffer)
+						e := labgob.NewEncoder(w)
+						e.Encode(kv.kvStore)
+						e.Encode(kv.lastApplied)
+						data := w.Bytes()
+						kv.rf.Snapshot(msg.CommandIndex, data)
+					}
+				}
+			}
+
+			kv.mu.Unlock()
+
+			// Notify waiting RPC if any
+			kv.mu.Lock()
+			ch, ok := kv.notifyCh[msg.CommandIndex]
+			delete(kv.notifyCh, msg.CommandIndex) // 在发送 *之前* 删除
+			kv.mu.Unlock()
+
+			if ok {
+				ch <- op // Notify the waiting RPC
+			}
+		}
 	}
 }
