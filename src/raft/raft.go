@@ -165,10 +165,10 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
-// RPC handler for sendSnapshot RPC.
+// RPC handler for InstallSnapshot RPC.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.persist()
+	defer rf.persist() // Persist state before releasing lock
 	defer rf.mu.Unlock()
 
 	// 1. Reply immediately if term < currentTerm
@@ -177,46 +177,52 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
+	// 2. If the received term is greater than the current term, convert to follower and update term
 	if args.Term > rf.currentTerm {
 		rf.stepDownToFollower(args.Term)
 	}
 
 	reply.Term = rf.currentTerm
-	rf.sendToChan(rf.heartbeatCh, true)
+	rf.sendToChan(rf.heartbeatCh, true) // Send heartbeat to reset election timeout
 
+	// 3. If the snapshot's last included index is less than or equal to the current last included index, do
+	// nothing. This is a no-op to prevent the follower from installing an older snapshot.
 	if args.LastIncludeIndex <= rf.lastIncludeIndex {
 		return
 	}
 
-	// 6. If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
+	// 4. If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
 	var newLogs []LogEntry
 
-	// 安全地检查日志匹配
+	// Check if the log entry at LastIncludeIndex matches the snapshot's last included entry
 	if entry, ok := rf.getLogAt(args.LastIncludeIndex); ok &&
 		entry.Term == args.LastIncludeTerm {
-		// 保留后续日志
+		// Retain subsequent log entries
 		newLogs = append([]LogEntry{},
 			rf.logs[args.LastIncludeIndex-rf.lastIncludeIndex:]...)
 	} else {
-		// 丢弃所有日志
+		// Discard all logs and start with a new log entry at the snapshot's last included term
 		newLogs = []LogEntry{{Command: nil, Term: args.LastIncludeTerm}}
 	}
 
+	// Update the snapshot and logs with the new snapshot data and retained log entries
 	rf.snapshot = args.Data
 	rf.logs = newLogs
 	rf.lastIncludeIndex = args.LastIncludeIndex
 	rf.lastIncludeTerm = args.LastIncludeTerm
 
 	lastApplied := rf.lastApplied
+	// 4. If the commit index is less than the last included index in the snapshot, update the commit index
 	if args.LastIncludeIndex > rf.commitIndex {
 		rf.commitIndex = args.LastIncludeIndex
 	}
 
+	// 5. If the last applied index is less than the last included index in the snapshot, update the last applied index and set flag for pending snapshot
 	if args.LastIncludeIndex > lastApplied {
 		rf.lastApplied = args.LastIncludeIndex
-		rf.hasPendingSnapshot = true // 设置标志而不是直接发送
-		rf.snapshot = args.Data      // 保存快照数据
-		rf.hasNewCommit.Signal()     // 通知 committer 处理
+		rf.hasPendingSnapshot = true // Set flag to indicate a pending snapshot
+		rf.snapshot = args.Data      // Save the snapshot data
+		rf.hasNewCommit.Signal()     // Notify the committer to process the new commit
 	}
 }
 
@@ -263,16 +269,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 安全获取日志条目
 	entry, ok := rf.getLogAt(index)
 	if !ok {
-		return // 如果日志条目不存在，直接返回
+		return // 如果日志条目已经在快照中，或者请求的日志超出范围，则不做任何处理
 	}
 	lastIncludeTerm := entry.Term
 
 	// 创建新的日志切片
 	newLog := make([]LogEntry, 0)
-	// 注意：这里要检查切片范围
-	if index-rf.lastIncludeIndex < len(rf.logs) {
-		newLog = append(newLog, rf.logs[index-rf.lastIncludeIndex:]...)
-	}
+	newLog = append(newLog, rf.logs[index-rf.lastIncludeIndex:]...)
 
 	// 更新快照相关状态
 	rf.lastIncludeIndex = index
@@ -312,7 +315,7 @@ func (rf *Raft) getLogAt(i int) (LogEntry, bool) {
 	if i < rf.lastIncludeIndex {
 		return LogEntry{}, false
 	}
-	if i-rf.lastIncludeIndex < 0 || i-rf.lastIncludeIndex >= len(rf.logs) {
+	if i-rf.lastIncludeIndex >= len(rf.logs) {
 		return LogEntry{}, false
 	}
 	return rf.logs[i-rf.lastIncludeIndex], true
@@ -693,6 +696,34 @@ func (rf *Raft) broadcastAppendEntries() {
 		return
 	}
 
+	// 创建快照安装参数的辅助函数
+	createSnapshotArgs := func() *InstallSnapshotArgs {
+		return &InstallSnapshotArgs{
+			Term:             rf.currentTerm,
+			LeaderId:         rf.me,
+			LastIncludeIndex: rf.lastIncludeIndex,
+			LastIncludeTerm:  rf.lastIncludeTerm,
+			Data:             rf.snapshot,
+		}
+	}
+
+	// 创建追加日志参数的辅助函数
+	createAppendEntriesArgs := func(prevLogIndex int, prevLogTerm int, server int) *AppendEntriesArgs {
+		entries := make([]LogEntry, 0)
+		if rf.nextIndex[server]-rf.lastIncludeIndex <= len(rf.logs) {
+			entries = append(entries, rf.logs[rf.nextIndex[server]-rf.lastIncludeIndex:]...)
+		}
+
+		return &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: rf.commitIndex,
+			Entries:      entries,
+		}
+	}
+
 	// 预先准备好所有参数
 	args := make([]interface{}, len(rf.peers))
 	for server := range rf.peers {
@@ -700,50 +731,19 @@ func (rf *Raft) broadcastAppendEntries() {
 			continue
 		}
 
-		// 如果 nextIndex 落后于快照，发送快照
-		if rf.lastIncludeIndex >= rf.nextIndex[server] {
-			args[server] = &InstallSnapshotArgs{
-				Term:             rf.currentTerm,
-				LeaderId:         rf.me,
-				LastIncludeIndex: rf.lastIncludeIndex,
-				LastIncludeTerm:  rf.lastIncludeTerm,
-				Data:             rf.snapshot,
-			}
+		// 获取前一个日志的索引和任期
+		prevLogIndex := rf.nextIndex[server] - 1
+		var prevLogTerm int
+
+		// 根据能否获取日志决定发送快照还是日志
+		if prevLogIndex == rf.lastIncludeIndex {
+			prevLogTerm = rf.lastIncludeTerm
+			args[server] = createAppendEntriesArgs(prevLogIndex, prevLogTerm, server)
+		} else if entry, ok := rf.getLogAt(prevLogIndex); ok {
+			prevLogTerm = entry.Term
+			args[server] = createAppendEntriesArgs(prevLogIndex, prevLogTerm, server)
 		} else {
-			// 准备日志条目
-			prevLogIndex := rf.nextIndex[server] - 1
-			var prevLogTerm int
-			// 安全获取 PrevLogTerm
-			if prevLogIndex == rf.lastIncludeIndex {
-				prevLogTerm = rf.lastIncludeTerm
-			} else if entry, ok := rf.getLogAt(prevLogIndex); ok {
-				prevLogTerm = entry.Term
-			} else {
-				// 如果无法获取前一个日志的任期，回退到发送快照
-				args[server] = &InstallSnapshotArgs{
-					Term:             rf.currentTerm,
-					LeaderId:         rf.me,
-					LastIncludeIndex: rf.lastIncludeIndex,
-					LastIncludeTerm:  rf.lastIncludeTerm,
-					Data:             rf.snapshot,
-				}
-				continue
-			}
-
-			// 准备要发送的日志条目
-			entries := make([]LogEntry, 0)
-			if rf.nextIndex[server]-rf.lastIncludeIndex <= len(rf.logs) {
-				entries = append(entries, rf.logs[rf.nextIndex[server]-rf.lastIncludeIndex:]...)
-			}
-
-			args[server] = &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				LeaderCommit: rf.commitIndex,
-				Entries:      entries,
-			}
+			args[server] = createSnapshotArgs()
 		}
 	}
 

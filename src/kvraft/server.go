@@ -255,7 +255,7 @@ func (kv *KVServer) applyLoop() {
 			op := msg.Command.(Op)
 			kv.mu.Lock()
 
-			if msg.CommandIndex > kv.lastIndex || msg.SnapshotValid {
+			if msg.CommandIndex > kv.lastIndex {
 				// Check if this is a new operation from this client
 				if lastSeq, exist := kv.lastApplied[op.ClientId]; !exist || op.RequestId > lastSeq {
 					// Apply the operation
