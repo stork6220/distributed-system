@@ -7,6 +7,7 @@ package shardctrler
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 	"time"
 
 	"6.5840/labrpc"
@@ -17,6 +18,7 @@ type Clerk struct {
 	// Your data here.
 	clientId  int64 // 客户端唯一标识
 	requestId int64 // 请求序号
+	mu        sync.Mutex
 }
 
 func nrand() int64 {
@@ -36,12 +38,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 }
 
 func (ck *Clerk) Query(num int) Config {
+	// 只保护requestId的访问
+	ck.mu.Lock()
+	requestId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
 	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-	ck.requestId++ // 增加请求序号
+	args.RequestId = requestId
+
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -56,12 +64,17 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
+	// 只保护requestId的访问
+	ck.mu.Lock()
+	requestId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
 	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-	ck.requestId++ // Increment the request ID for next request
+	args.RequestId = requestId
 
 	for {
 		// try each known server.
@@ -77,12 +90,17 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
+	// 只保护requestId的访问
+	ck.mu.Lock()
+	requestId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
 	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-	ck.requestId++ // Increment the request ID for next request
+	args.RequestId = requestId
 
 	for {
 		// try each known server.
@@ -98,13 +116,18 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
+	// 只保护requestId的访问
+	ck.mu.Lock()
+	requestId := ck.requestId
+	ck.requestId++
+	ck.mu.Unlock()
+
 	args := &MoveArgs{}
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
 	args.ClientId = ck.clientId
-	args.RequestId = ck.requestId
-	ck.requestId++ // Increment the request ID for next request
+	args.RequestId = requestId
 
 	for {
 		// try each known server.

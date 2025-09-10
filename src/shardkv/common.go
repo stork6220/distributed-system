@@ -27,6 +27,8 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId  int64
+	RequestId int64
 }
 
 type PutAppendReply struct {
@@ -36,9 +38,34 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ClientId  int64
+	RequestId int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type MigrateArgs struct {
+	ConfigNum int
+	Shard     int
+}
+
+type MigrateReply struct {
+	Err       Err
+	ConfigNum int
+	Shard     int
+	Data      map[string]string
+	LastSeq   map[int64]int64
+}
+
+// DeleteShard RPC - 从旧分片组删除分片
+type DeleteShardArgs struct {
+	ConfigNum int
+	Shard     int
+}
+
+type DeleteShardReply struct {
+	Err Err
 }
