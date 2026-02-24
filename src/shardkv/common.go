@@ -1,5 +1,7 @@
 package shardkv
 
+import "fmt"
+
 //
 // Sharded key/value server.
 // Lots of replica groups, each running Raft.
@@ -8,6 +10,14 @@ package shardkv
 //
 // You will have to modify these definitions.
 //
+
+const Debug = false
+
+func DPrintf(format string, a ...interface{}) {
+	if Debug {
+		fmt.Printf(format+"\n", a...)
+	}
+}
 
 const (
 	OK             = "OK"
